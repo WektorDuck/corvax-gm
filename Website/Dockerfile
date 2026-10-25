@@ -13,8 +13,8 @@ COPY Website/ ./
 COPY Website/DataBase/database.db /app/seed/database.db
 
 RUN mkdir -p /app/Website/DataBase \
-    && chmod +x /app/docker-entrypoint.sh
+    && chmod +x /app/Website/docker-entrypoint.sh
 
 EXPOSE 3000
 
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
+ENTRYPOINT ["/app/Website/docker-entrypoint.sh"]
