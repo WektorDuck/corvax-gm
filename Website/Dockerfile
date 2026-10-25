@@ -2,7 +2,7 @@
 FROM node:22-bookworm-slim
 
 ENV NODE_ENV=production
-ENV PORT=3000
+ENV PORT=3001
 ENV npm_config_build_from_source=true
 
 WORKDIR /app/Website
@@ -28,6 +28,6 @@ COPY Website/DataBase/database.db /app/seed/database.db
 RUN mkdir -p /app/Website/DataBase \
     && chmod +x /app/Website/docker-entrypoint.sh
 
-EXPOSE 3000
+EXPOSE 3001
 
 ENTRYPOINT ["/app/Website/docker-entrypoint.sh"]
