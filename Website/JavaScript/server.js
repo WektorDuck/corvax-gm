@@ -78,8 +78,8 @@ app.get("/auth/callback", async (req, res) => {
     const expected = req.session.state;
     req.session.state = null;
 
-    if (error) return res.redirect("/login.html?error=denied");
-    if (!code || !state || state !== expected) return res.redirect("/login.html?error=failed");
+    if (error) return res.redirect("/login?error=denied");
+    if (!code || !state || state !== expected) return res.redirect("/login?error=failed");
 
     try {
         const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
@@ -110,7 +110,7 @@ app.get("/auth/callback", async (req, res) => {
              SELECT discord_id FROM user_roles_moderation WHERE discord_id = ? COLLATE NOCASE`,
             [d.id, String(d.username || "").toLowerCase()]
         );
-        if (!user) return res.redirect("/login.html?error=not_registered");
+        if (!user) return res.redirect("/login?error=not_registered");
 
         req.session = {
             discordId: d.id,
@@ -123,26 +123,36 @@ app.get("/auth/callback", async (req, res) => {
         res.redirect("/");
     } catch (err) {
         console.error("Ошибка входа через Discord:", err);
-        res.redirect("/login.html?error=failed");
+        res.redirect("/login?error=failed");
     }
 });
 
 app.get("/auth/logout", (req, res) => {
     req.session = null;
-    res.redirect("/login.html");
+    res.redirect("/login");
+});
+
+// Старые адреса с .html ведут на адреса без него
+app.use((req, res, next) => {
+    if ((req.method === "GET" || req.method === "HEAD") && req.path.endsWith(".html")) {
+        const q = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+        const clean = req.path.slice(0, -5);
+        return res.redirect((clean === "/index" ? "/" : clean) + q);
+    }
+    next();
 });
 
 // ---------- Защита: без входа доступны только страница входа и стили ----------
-const PUBLIC = new Set(["/login.html", "/style.css"]);
+const PUBLIC = new Set(["/login", "/style.css", "/images/logo.png"]);
 
 app.use((req, res, next) => {
     const loggedIn = Boolean(req.session && req.session.discordId && req.session.username);   // старые сессии без username входят заново
 
-    if (req.path === "/login.html" && loggedIn) return res.redirect("/");
+    if (req.path === "/login" && loggedIn) return res.redirect("/");
     if (PUBLIC.has(req.path) || loggedIn) return next();
 
     if (req.path.startsWith("/api/")) return res.status(401).json({ error: "unauthorized" });
-    res.redirect("/login.html");
+    res.redirect("/login");
 });
 
 // Ключ сотрудника модерации - логин Discord так, как он записан в users_moderation.
@@ -151,7 +161,7 @@ app.use(async (req, res, next) => {
     req.modId = null;
     try {
         const username = req.session && req.session.username;
-        const isAsset = req.path.includes(".") && !req.path.endsWith(".html");
+        const isAsset = path.extname(req.path) !== "";
         if (username && !isAsset) {
             const row = await get("SELECT discord_id AS id FROM users_moderation WHERE discord_id = ? COLLATE NOCASE", [username]);
             req.modId = row ? row.id : null;
@@ -336,7 +346,7 @@ async function requireReviewer(req, res, next) {
         next(err);
     }
 }
-app.get("/table.html", requireReviewer);         // страницу видят с уровня TABLE_MIN_LEVEL
+app.get("/table", requireReviewer);         // страницу видят с уровня TABLE_MIN_LEVEL
 
 // ----- Управление ролями (общий код для обоих отделов) -----
 // page - страница, api - префикс API. Для ГМ адреса прежние, для модерации - с приставкой mod.
@@ -461,8 +471,8 @@ function mountRoleManagement(dept, { page, api }) {
     }));
 }
 
-mountRoleManagement(GM,  { page: "/roles.html",     api: "/api/roles" });
-mountRoleManagement(MOD, { page: "/roles-mod.html", api: "/api/mod/roles" });
+mountRoleManagement(GM,  { page: "/roles",     api: "/api/roles" });
+mountRoleManagement(MOD, { page: "/roles-mod", api: "/api/mod/roles" });
 
 // ---------- Своды, ивенты и оценки (только ГМ) ----------
 // Максимум по каждому из трёх критериев (оценка 1, оценка 2, оценка 3). Меняйте здесь.
@@ -947,7 +957,7 @@ async function requireModTableAccess(req, res, next) {
         next(err);
     }
 }
-app.get("/table-mod.html", requireModTableAccess);
+app.get("/table-mod", requireModTableAccess);
 app.use("/api/mod/ratings", requireModTableAccess);
 
 // В таблице все, кто есть в users_moderation (роль не обязательна); оценки - за выбранный свод
@@ -1269,19 +1279,20 @@ const requireDeptPage = dept => async (req, res, next) => {
 };
 
 app.get("/", safe(async (req, res) => {
-    if (await isMember(GM, req.session.discordId)) return res.redirect("/main.html");
-    if (await isMember(MOD, req.modId)) return res.redirect("/main_mod.html");
+    if (await isMember(GM, req.session.discordId)) return res.redirect("/main");
+    if (await isMember(MOD, req.modId)) return res.redirect("/main_mod");
     req.session = null;                     // человека убрали из обеих таблиц
-    res.redirect("/login.html?error=not_registered");
+    res.redirect("/login?error=not_registered");
 }));
 
-app.get("/index.html", (req, res) => res.redirect("/"));   // старые ссылки и закладки
+app.get("/index", (req, res) => res.redirect("/"));   // старые ссылки и закладки
 
-app.get(["/main.html", "/profile.html", "/summary.html", "/my-events.html"], requireDeptPage(GM));
-app.get(["/main_mod.html", "/summary-mod.html", "/mod-summary.html", "/profile-mod.html"], requireDeptPage(MOD));
+app.get(["/main", "/profile", "/summary", "/my-events"], requireDeptPage(GM));
+app.get(["/main_mod", "/summary-mod", "/mod-summary", "/profile-mod"], requireDeptPage(MOD));
 
 // ---------- Сайт ----------
 // Отдаём ТОЛЬКО папку с фронтендом, не корень проекта (там .env и база)
-app.use(express.static(path.join(__dirname, "..", "HTML-CSS")));
+app.use("/images", express.static(path.join(__dirname, "..", "Images")));
+app.use(express.static(path.join(__dirname, "..", "HTML-CSS"), { extensions: ["html"] }));
 
 app.listen(PORT, () => console.log(`Сайт: http://localhost:${PORT}`));
