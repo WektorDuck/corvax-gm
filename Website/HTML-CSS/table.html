@@ -61,12 +61,7 @@
         <h2 id="rate-title">Оценка ивента</h2>
         <p id="rate-sub"></p>
         <table class="mini">
-            <tbody>
-                <tr><th>Оценка 1</th><td><input type="number" min="0" step="0.5" inputmode="decimal" aria-label="Оценка 1"></td></tr>
-                <tr><th>Оценка 2</th><td><input type="number" min="0" step="0.5" inputmode="decimal" aria-label="Оценка 2"></td></tr>
-                <tr><th>Оценка 3</th><td><input type="number" min="0" step="0.5" inputmode="decimal" aria-label="Оценка 3"></td></tr>
-                <tr class="total"><th>Общая оценка</th><td><output id="rate-total">—</output></td></tr>
-            </tbody>
+            <tbody id="rate-body"></tbody>
         </table>
         <label class="cm-label" for="rate-comment">Комментарий</label>
         <textarea class="field-input" id="rate-comment" rows="3" maxlength="500" placeholder="Необязательно"></textarea>
@@ -81,14 +76,17 @@
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-let MAX_SCORES = [15, 5, 10];        // максимум по каждому критерию, приходит с сервера
-let MAX_TOTAL = 30;                  // максимум общей оценки (сумма трёх)
+// Критерии, максимумы и подписи приходят с сервера, здесь только значения по умолчанию
+let MAX_SCORES = [6, 4, 6, 4, 5];
+let MAX_TOTAL = 25;
+let LABELS = ["Идея", "Атмосфера", "Реализация", "Тех. Часть", "Свободные Баллы"];
 let periods = [];
 let events = [];
 let periodId = null;
 
-const total = a => Math.round(a.reduce((x, y) => x + y, 0) * 10) / 10;   // общая = сумма трёх
-const tone = t => t >= MAX_TOTAL * 0.8 ? "good" : t >= MAX_TOTAL * 0.5 ? "mid" : "bad";   // от 80% и от 50% максимума
+const total = a => Math.round(a.reduce((x, y) => x + y, 0) * 10) / 10;   // общая = сумма всех критериев
+// Цвет считается от максимума шкалы самой оценки: у старых оценок (по трём критериям) он свой
+const tone = (t, max = MAX_TOTAL) => t >= max * 0.8 ? "good" : t >= max * 0.5 ? "mid" : "bad";   // от 80% и от 50% максимума
 
 const COMMENT_PREVIEW = 8;           // сколько символов комментария видно в таблице
 const preview = t => {
@@ -105,7 +103,7 @@ async function api(url, body) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
     } : undefined);
-    if (res.status === 401) { location.href = "/login.html"; throw new Error("Нужно войти заново."); }
+    if (res.status === 401) { location.href = "/login"; throw new Error("Нужно войти заново."); }
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || "Ошибка сервера.");
     return data;
@@ -118,11 +116,12 @@ function render() {
     if (!list.length) { rows.innerHTML = emptyRow("Нет ивентов под выбранные фильтры"); return; }
     rows.innerHTML = list.map(e => {
         const t = e.s ? e.total : null;
-        const cls = t === null ? "wait" : tone(t);
+        const cls = t === null ? "wait" : tone(t, e.max);
         const text = t === null ? "—" : t;
+        const old = e.legacy ? `Старая оценка, шкала до ${e.max}. ` : "";
         const score = e.canReview
-            ? `<button class="score ${cls}" data-rate="${e.id}" title="Поставить оценку">${text}</button>`
-            : `<span class="score ${cls}">${text}</span>`;
+            ? `<button class="score ${cls}" data-rate="${e.id}" title="${old}Поставить оценку">${text}</button>`
+            : `<span class="score ${cls}"${e.legacy ? ` title="${old.trim()}"` : ""}>${text}</span>`;
         // Тем, кто может оценивать, комментарий открывается на редактирование по клику
         const edit = e.canReview ? ` data-rate="${e.id}" data-focus="comment"` : "";
         const cm = e.comment
@@ -150,7 +149,8 @@ async function loadEvents() {
         const data = await api(`/api/events?period=${periodId}`);
         MAX_SCORES = data.maxScores;
         MAX_TOTAL = data.maxTotal;
-        inputs.forEach((i, n) => { i.max = MAX_SCORES[n]; i.placeholder = `0–${MAX_SCORES[n]}`; });
+        LABELS = data.labels || MAX_SCORES.map((_, i) => `Оценка ${i + 1}`);
+        buildForm();
         events = data.events;
         buildFilters();
         render();
@@ -423,21 +423,29 @@ document.addEventListener("keydown", ev => { if (ev.key === "Escape" && pinnedId
 
 /* ---------- Окно оценки ---------- */
 const dlg = $("rate");
-const inputs = [...dlg.querySelectorAll("input")];
-const totalEl = $("rate-total");
+const rateBody = $("rate-body");
 const saveBtn = $("rate-save");
 const rateErr = $("rate-err");
+let inputs = [];
 let current = null;
+
+// Поля критериев строятся из данных сервера: сколько критериев, как называются и какой у каждого максимум
+function buildForm() {
+    rateBody.innerHTML = LABELS.map((l, n) => `
+        <tr><th>${esc(l)}</th><td><input type="number" min="0" max="${MAX_SCORES[n]}" step="0.5" inputmode="decimal" placeholder="0–${MAX_SCORES[n]}" aria-label="${esc(l)}"></td></tr>`
+    ).join("") + '<tr class="total"><th>Общая оценка</th><td><output id="rate-total">—</output></td></tr>';
+    inputs = [...rateBody.querySelectorAll("input")];
+    inputs.forEach(i => i.addEventListener("input", readInputs));
+}
 
 function readInputs() {
     const v = inputs.map((i, n) => i.value === "" ? NaN : Math.min(MAX_SCORES[n], Math.max(0, Number(i.value))));
-    const ok = v.every(n => !isNaN(n));
-    totalEl.textContent = ok ? `${total(v)} из ${MAX_TOTAL}` : "—";
+    const ok = v.length > 0 && v.every(n => !isNaN(n));
+    const totalEl = $("rate-total");
+    if (totalEl) totalEl.textContent = ok ? `${total(v)} из ${MAX_TOTAL}` : "—";
     saveBtn.disabled = !ok;
     return ok ? v : null;
 }
-
-inputs.forEach(i => i.addEventListener("input", readInputs));
 
 rows.addEventListener("click", ev => {
     const b = ev.target.closest("[data-rate]");
@@ -445,8 +453,10 @@ rows.addEventListener("click", ev => {
     unpin();
     current = events.find(x => x.id == b.dataset.rate);
     if (!current) return;
-    $("rate-sub").textContent = `Ивент #${current.id}, проводящий ${current.host}`;
-    inputs.forEach((i, n) => { i.value = current.s ? current.s[n] : ""; });
+    // Старая оценка выставлена по другим критериям, поэтому поля остаются пустыми: её нужно выставить заново
+    $("rate-sub").textContent = `Ивент #${current.id}, проводящий ${current.host}` +
+        (current.legacy ? `. Сейчас стоит старая оценка: ${current.total} из ${current.max}. Заполните все поля по новой шкале.` : "");
+    inputs.forEach((i, n) => { i.value = current.s && !current.legacy ? current.s[n] : ""; });
     $("rate-comment").value = current.comment || "";
     rateErr.textContent = "";
     readInputs();
