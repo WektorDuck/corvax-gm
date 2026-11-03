@@ -475,9 +475,36 @@ mountRoleManagement(GM,  { page: "/roles",     api: "/api/roles" });
 mountRoleManagement(MOD, { page: "/roles-mod", api: "/api/mod/roles" });
 
 // ---------- Своды, ивенты и оценки (только ГМ) ----------
-// Максимум по каждому из трёх критериев (оценка 1, оценка 2, оценка 3). Меняйте здесь.
-const MAX_SCORES = [15, 5, 10];
-const MAX_TOTAL = MAX_SCORES.reduce((a, b) => a + b, 0);   // максимум общей оценки
+// Критерии оценки ГМ: максимум по каждому и подписи в окне оценки. Меняйте здесь.
+const MAX_SCORES = [6, 4, 6, 4, 5];
+const SCORE_LABELS = ["Оценка 1", "Оценка 2", "Оценка 3", "Оценка 4", "Оценка 5"];
+const MAX_TOTAL = MAX_SCORES.reduce((a, b) => a + b, 0);   // максимум общей оценки (сейчас 25)
+
+// Старые оценки выставлены по трём критериям (у них пустые score_4 и score_5).
+// Они остаются как были и показываются по своей шкале, а в средних приводятся к текущей шкале.
+const LEGACY_MAX_SCORES = [15, 5, 10];
+const LEGACY_MAX_TOTAL = LEGACY_MAX_SCORES.reduce((a, b) => a + b, 0);   // сейчас 30
+const NORMALIZE_LEGACY = true;     // false - в средних старые оценки считаются как есть, без пересчёта
+
+// SQL: итоговая оценка, приведённая к текущей шкале (a - имя таблицы или псевдоним reviews_gm)
+const normTotal = a => NORMALIZE_LEGACY
+    ? `(CASE WHEN ${a}.score_4 IS NULL THEN ${a}.total_score * ${MAX_TOTAL}.0 / ${LEGACY_MAX_TOTAL} ELSE ${a}.total_score END)`
+    : `${a}.total_score`;
+
+// Оценка ивента для страницы. Старая (по трём критериям) помечается legacy и имеет свою шкалу.
+function scoreView(r) {
+    if (r.total_score === null || r.total_score === undefined) {
+        return { s: null, total: null, legacy: false, max: MAX_TOTAL, maxScores: MAX_SCORES };
+    }
+    const legacy = r.score_4 === null || r.score_4 === undefined;
+    return {
+        s: legacy ? [r.score_1, r.score_2, r.score_3] : [r.score_1, r.score_2, r.score_3, r.score_4, r.score_5],
+        total: r.total_score,
+        legacy,
+        max: legacy ? LEGACY_MAX_TOTAL : MAX_TOTAL,
+        maxScores: legacy ? LEGACY_MAX_SCORES : MAX_SCORES
+    };
+}
 const MAX_COMMENT = 500;            // максимум символов в комментарии
 
 // Один ивент - одна оценка
@@ -542,7 +569,7 @@ app.get("/api/events", requireReviewer, safe(async (req, res) => {
                 hu.ckey AS host,
                 pr.is_closed AS closed,
                 rv.reviewer_discord_id, ru.ckey AS reviewer,
-                rv.score_1, rv.score_2, rv.score_3, rv.total_score, rv.comment
+                rv.score_1, rv.score_2, rv.score_3, rv.score_4, rv.score_5, rv.total_score, rv.comment
          FROM events e
          JOIN periods pr ON pr.id = e.period_id
          JOIN users_gm hu ON hu.discord_id = e.host_discord_id
@@ -554,29 +581,26 @@ app.get("/api/events", requireReviewer, safe(async (req, res) => {
     );
 
     res.json({
+        labels: SCORE_LABELS,
         maxScores: MAX_SCORES,
         maxTotal: MAX_TOTAL,
-        events: rows.map(r => {
-            const rated = r.total_score !== null;
-            return {
-                id: r.id,
-                date: fmtDate(r.event_date),
-                size: r.size,
-                server: r.server,
-                host: r.host,
-                desc: r.description,
-                reviewer: r.reviewer || null,
-                s: rated ? [r.score_1, r.score_2, r.score_3] : null,
-                total: rated ? r.total_score : null,
-                comment: r.comment || null,
-                // Кнопку оценки показываем только тем, кому её можно нажать
-                canReview:
-                    p.maxLevel >= REVIEW_MIN_LEVEL &&
-                    r.host_discord_id !== me &&
-                    (!r.closed || p.maxLevel >= CLOSED_EDIT_LEVEL) &&
-                    (!r.reviewer_discord_id || r.reviewer_discord_id === me || p.maxLevel >= REVIEW_EDIT_ANY_LEVEL)
-            };
-        })
+        events: rows.map(r => ({
+            id: r.id,
+            date: fmtDate(r.event_date),
+            size: r.size,
+            server: r.server,
+            host: r.host,
+            desc: r.description,
+            reviewer: r.reviewer || null,
+            ...scoreView(r),            // s, total, legacy, max, maxScores
+            comment: r.comment || null,
+            // Кнопку оценки показываем только тем, кому её можно нажать
+            canReview:
+                p.maxLevel >= REVIEW_MIN_LEVEL &&
+                r.host_discord_id !== me &&
+                (!r.closed || p.maxLevel >= CLOSED_EDIT_LEVEL) &&
+                (!r.reviewer_discord_id || r.reviewer_discord_id === me || p.maxLevel >= REVIEW_EDIT_ANY_LEVEL)
+        }))
     });
 }));
 
@@ -586,8 +610,10 @@ app.post("/api/reviews", safe(async (req, res) => {
     const raw = Array.isArray(body.scores) ? body.scores : [];
 
     if (!Number.isInteger(eventId)) throw new HttpError(400, "Не указан ивент.");
-    if (raw.length !== 3 || raw.some((n, i) => typeof n !== "number" || !Number.isFinite(n) || n < 0 || n > MAX_SCORES[i])) {
-        throw new HttpError(400, `Оценки должны быть числами: от 0 до ${MAX_SCORES[0]}, от 0 до ${MAX_SCORES[1]} и от 0 до ${MAX_SCORES[2]}.`);
+    if (raw.length !== MAX_SCORES.length ||
+        raw.some((n, i) => typeof n !== "number" || !Number.isFinite(n) || n < 0 || n > MAX_SCORES[i])) {
+        const rules = MAX_SCORES.map((m, i) => `${SCORE_LABELS[i]} от 0 до ${m}`).join(", ");
+        throw new HttpError(400, `Оценки должны быть числами: ${rules}.`);
     }
     const rawComment = body.comment == null ? "" : body.comment;
     if (typeof rawComment !== "string") throw new HttpError(400, "Комментарий должен быть текстом.");
@@ -595,7 +621,7 @@ app.post("/api/reviews", safe(async (req, res) => {
     if (comment.length > MAX_COMMENT) throw new HttpError(400, `Комментарий не длиннее ${MAX_COMMENT} символов.`);
 
     const scores = raw.map(round1);
-    const total = round1(scores[0] + scores[1] + scores[2]);
+    const total = round1(scores.reduce((a, b) => a + b, 0));
     const me = req.session.discordId;
 
     await inTransaction(async () => {
@@ -613,7 +639,8 @@ app.post("/api/reviews", safe(async (req, res) => {
         if (event.closed && p.maxLevel < CLOSED_EDIT_LEVEL) throw new HttpError(403, "Свод закрыт, оценки менять нельзя.");
 
         const old = await get(
-            "SELECT id, reviewer_discord_id, score_1, score_2, score_3, total_score FROM reviews_gm WHERE event_id = ?",
+            `SELECT id, reviewer_discord_id, score_1, score_2, score_3, score_4, score_5, total_score
+             FROM reviews_gm WHERE event_id = ?`,
             [eventId]
         );
 
@@ -621,27 +648,35 @@ app.post("/api/reviews", safe(async (req, res) => {
             if (old.reviewer_discord_id !== me && p.maxLevel < REVIEW_EDIT_ANY_LEVEL) {
                 throw new HttpError(403, "Этот ивент уже оценил другой рецензент.");
             }
+            // У старой оценки score_4 и score_5 пустые, поэтому её пересохранение по новой шкале всегда попадает в историю
             const changed = old.score_1 !== scores[0] || old.score_2 !== scores[1] ||
-                            old.score_3 !== scores[2] || old.total_score !== total;
+                            old.score_3 !== scores[2] || old.score_4 !== scores[3] ||
+                            old.score_5 !== scores[4] || old.total_score !== total;
             if (changed) await run(
                 `INSERT INTO review_history_gm
                     (review_id, editor_discord_id,
-                     old_score_1, old_score_2, old_score_3, new_score_1, new_score_2, new_score_3,
+                     old_score_1, old_score_2, old_score_3, old_score_4, old_score_5,
+                     new_score_1, new_score_2, new_score_3, new_score_4, new_score_5,
                      old_total, new_total)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [old.id, me, old.score_1, old.score_2, old.score_3, scores[0], scores[1], scores[2], old.total_score, total]
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [old.id, me,
+                 old.score_1, old.score_2, old.score_3, old.score_4, old.score_5,
+                 scores[0], scores[1], scores[2], scores[3], scores[4],
+                 old.total_score, total]
             );
             await run(
                 `UPDATE reviews_gm
-                 SET score_1 = ?, score_2 = ?, score_3 = ?, total_score = ?, comment = ?, updated_at = CURRENT_TIMESTAMP
+                 SET score_1 = ?, score_2 = ?, score_3 = ?, score_4 = ?, score_5 = ?, total_score = ?,
+                     comment = ?, updated_at = CURRENT_TIMESTAMP
                  WHERE id = ?`,
-                [scores[0], scores[1], scores[2], total, comment || null, old.id]
+                [...scores, total, comment || null, old.id]
             );
         } else {
             await run(
-                `INSERT INTO reviews_gm (event_id, reviewer_discord_id, score_1, score_2, score_3, total_score, comment)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [eventId, me, scores[0], scores[1], scores[2], total, comment || null]
+                `INSERT INTO reviews_gm
+                    (event_id, reviewer_discord_id, score_1, score_2, score_3, score_4, score_5, total_score, comment)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [eventId, me, ...scores, total, comment || null]
             );
         }
     });
@@ -660,7 +695,7 @@ app.get("/api/profile", requireGm, safe(async (req, res) => {
     // По каждому своду, где у человека есть ивенты: сколько, сколько оценено, средняя и комментарий к своду
     const periods = await all(
         `SELECT pr.id, pr.name, pr.is_closed AS closed,
-                COUNT(e.id) AS events, COUNT(rv.id) AS rated, AVG(rv.total_score) AS avg,
+                COUNT(e.id) AS events, COUNT(rv.id) AS rated, AVG(${normTotal("rv")}) AS avg,
                 sc.comment AS summaryComment, au.ckey AS summaryBy
          FROM periods pr
          LEFT JOIN events e ON e.period_id = pr.id AND e.host_discord_id = ?
@@ -674,7 +709,7 @@ app.get("/api/profile", requireGm, safe(async (req, res) => {
     );
 
     const overall = await get(
-        `SELECT AVG(rv.total_score) AS avg
+        `SELECT AVG(${normTotal("rv")}) AS avg
          FROM events e JOIN reviews_gm rv ON rv.event_id = e.id
          WHERE e.host_discord_id = ?`,
         [me]
@@ -684,7 +719,7 @@ app.get("/api/profile", requireGm, safe(async (req, res) => {
     let reviewer = null;
     if (p.maxLevel >= REVIEW_MIN_LEVEL) {
         const r = await get(
-            "SELECT COUNT(*) AS n, AVG(total_score) AS avg FROM reviews_gm WHERE reviewer_discord_id = ?",
+            `SELECT COUNT(*) AS n, AVG(${normTotal("reviews_gm")}) AS avg FROM reviews_gm WHERE reviewer_discord_id = ?`,
             [me]
         );
         const written = await get(
@@ -731,7 +766,7 @@ app.get("/api/my-events", requireGm, safe(async (req, res) => {
         `SELECT e.id, e.event_date, e.server, e.size, e.description,
                 hu.ckey AS host,
                 ru.ckey AS reviewer,
-                rv.score_1, rv.score_2, rv.score_3, rv.total_score, rv.comment
+                rv.score_1, rv.score_2, rv.score_3, rv.score_4, rv.score_5, rv.total_score, rv.comment
          FROM events e
          JOIN users_gm hu ON hu.discord_id = e.host_discord_id
          LEFT JOIN reviews_gm rv ON rv.event_id = e.id
@@ -742,23 +777,20 @@ app.get("/api/my-events", requireGm, safe(async (req, res) => {
     );
 
     res.json({
+        labels: SCORE_LABELS,
         maxScores: MAX_SCORES,
         maxTotal: MAX_TOTAL,
-        events: rows.map(r => {
-            const rated = r.total_score !== null;
-            return {
-                id: r.id,
-                date: fmtDate(r.event_date),
-                size: r.size,
-                server: r.server,
-                host: r.host,
-                desc: r.description,
-                reviewer: r.reviewer || null,
-                s: rated ? [r.score_1, r.score_2, r.score_3] : null,
-                total: rated ? r.total_score : null,
-                comment: r.comment || null
-            };
-        })
+        events: rows.map(r => ({
+            id: r.id,
+            date: fmtDate(r.event_date),
+            size: r.size,
+            server: r.server,
+            host: r.host,
+            desc: r.description,
+            reviewer: r.reviewer || null,
+            ...scoreView(r),            // s, total, legacy, max, maxScores
+            comment: r.comment || null
+        }))
     });
 }));
 
@@ -799,13 +831,13 @@ app.get("/api/summary", requireGm, safe(async (req, res) => {
         `SELECT e.host_discord_id AS hostId, u.ckey AS host,
                 COUNT(*) AS events,
                 COUNT(rv.id) AS rated,
-                AVG(rv.total_score) AS avg
+                AVG(${normTotal("rv")}) AS avg
          FROM events e
          JOIN users_gm u ON u.discord_id = e.host_discord_id
          LEFT JOIN reviews_gm rv ON rv.event_id = e.id
          WHERE ${scope}
          GROUP BY e.host_discord_id
-         ORDER BY AVG(rv.total_score) IS NULL, AVG(rv.total_score) DESC, u.ckey COLLATE NOCASE`,
+         ORDER BY AVG(${normTotal("rv")}) IS NULL, AVG(${normTotal("rv")}) DESC, u.ckey COLLATE NOCASE`,
         [param]
     );
 
